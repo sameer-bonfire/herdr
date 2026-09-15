@@ -143,6 +143,67 @@ pub(crate) fn prepare_saved_ssh(target: &str, session_name: &str) -> io::Result<
     }
 }
 
+pub(crate) fn discover_running_ssh_sessions(target: &str) -> io::Result<Vec<String>> {
+    super::validate_remote_target(target)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let manage_ssh_config = crate::config::Config::load()
+        .config
+        .remote
+        .manage_ssh_config;
+    let ssh = RemoteSsh::new(
+        target.to_owned(),
+        manage_ssh_config,
+        crate::session::DEFAULT_SESSION_NAME.to_owned(),
+    );
+    let platform = detect_remote_platform(&ssh)?;
+    let remote_herdr = RemoteHerdr::for_platform(platform);
+    let candidates = remote_binary_candidates(&ssh, &remote_herdr)?;
+    for candidate in candidates {
+        let output = ssh.shell_output_captured(
+            &candidate.platform,
+            &candidate.executable.command(&["session", "list", "--json"]),
+        )?;
+        if output.status.code() == Some(255) {
+            return Err(command_failed("remote SSH connection failed", &output));
+        }
+        if !output.status.success() {
+            continue;
+        }
+        if let Some(sessions) =
+            parse_running_remote_sessions(&String::from_utf8_lossy(&output.stdout))
+        {
+            return Ok(sessions);
+        }
+    }
+    Ok(Vec::new())
+}
+
+#[derive(Deserialize)]
+struct RemoteSessionListJson {
+    sessions: Vec<RemoteSessionJson>,
+}
+
+#[derive(Deserialize)]
+struct RemoteSessionJson {
+    name: String,
+    #[serde(default)]
+    running: bool,
+}
+
+fn parse_running_remote_sessions(stdout: &str) -> Option<Vec<String>> {
+    let parsed = serde_json::from_str::<RemoteSessionListJson>(stdout.trim()).ok()?;
+    Some(
+        parsed
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                session.running && crate::session::validate_name(&session.name).is_ok()
+            })
+            .map(|session| session.name)
+            .collect(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemotePlatform {
     os: &'static str,
@@ -612,6 +673,14 @@ impl RemoteSsh {
     }
 
     fn sh_output(&self, script: &str) -> io::Result<Output> {
+        self.sh_output_impl(script, true)
+    }
+
+    fn sh_output_captured(&self, script: &str) -> io::Result<Output> {
+        self.sh_output_impl(script, false)
+    }
+
+    fn sh_output_impl(&self, script: &str, forward_stderr: bool) -> io::Result<Output> {
         let script = posix_remote_output_command(script);
         let mut child = self
             .command()
@@ -621,8 +690,8 @@ impl RemoteSsh {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        if !self.noninteractive {
-            return normalize_remote_output(output_with_forwarded_stderr(
+        if !self.noninteractive && forward_stderr {
+            return normalize_remote_output(output_with_captured_stderr(
                 child,
                 Some(script.as_bytes()),
             )?);
@@ -636,12 +705,28 @@ impl RemoteSsh {
                 "ssh bootstrap stdin missing",
             ))
         };
-        let output = wait_with_output_timeout(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)?;
+        let output = if self.noninteractive {
+            wait_with_output_timeout(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)?
+        } else {
+            child.wait_with_output()?
+        };
         write_result?;
         normalize_remote_output(output)
     }
 
     fn framed_user_shell_output(&self, remote_command: &str) -> io::Result<Output> {
+        self.framed_user_shell_output_impl(remote_command, true)
+    }
+
+    fn framed_user_shell_output_captured(&self, remote_command: &str) -> io::Result<Output> {
+        self.framed_user_shell_output_impl(remote_command, false)
+    }
+
+    fn framed_user_shell_output_impl(
+        &self,
+        remote_command: &str,
+        forward_stderr: bool,
+    ) -> io::Result<Output> {
         let mut command = self.command();
         command
             // Windows OpenSSH can still read the console with stdin redirected to NUL.
@@ -652,8 +737,10 @@ impl RemoteSsh {
             .stderr(Stdio::piped());
         let output = if self.noninteractive {
             wait_with_output_timeout(command.spawn()?, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)
+        } else if forward_stderr {
+            output_with_captured_stderr(command.spawn()?, None)
         } else {
-            output_with_forwarded_stderr(command.spawn()?, None)
+            command.output()
         }?;
         normalize_remote_output(output)
     }
@@ -667,6 +754,18 @@ impl RemoteSsh {
             self.framed_user_shell_output(remote_command)
         } else {
             self.sh_output(remote_command)
+        }
+    }
+
+    fn shell_output_captured(
+        &self,
+        platform: &RemotePlatform,
+        remote_command: &str,
+    ) -> io::Result<Output> {
+        if platform.is_windows() {
+            self.framed_user_shell_output_captured(remote_command)
+        } else {
+            self.sh_output_captured(remote_command)
         }
     }
 
@@ -795,9 +894,9 @@ impl RemoteSsh {
     }
 }
 
-// Only interactive setup uses this relay. Background probes retain their
-// capture-only timeout path so SSH diagnostics cannot overwrite the active TUI.
-fn output_with_forwarded_stderr(mut child: Child, stdin: Option<&[u8]>) -> io::Result<Output> {
+// Interactive setup still captures stderr so successful PowerShell commands do not expose CLIXML.
+// Failed commands replay the captured diagnostics before returning them to the caller.
+fn output_with_captured_stderr(mut child: Child, stdin: Option<&[u8]>) -> io::Result<Output> {
     let mut child_stderr = child
         .stderr
         .take()
@@ -805,17 +904,12 @@ fn output_with_forwarded_stderr(mut child: Child, stdin: Option<&[u8]>) -> io::R
     let stderr_relay = thread::spawn(move || -> io::Result<Vec<u8>> {
         let mut captured = Vec::new();
         let mut buffer = [0_u8; 8 * 1024];
-        let mut destination = io::stderr();
-
         loop {
             let read = child_stderr.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
             captured.extend_from_slice(&buffer[..read]);
-            if destination.write_all(&buffer[..read]).is_ok() {
-                let _ = destination.flush();
-            }
         }
 
         Ok(captured)
@@ -841,6 +935,11 @@ fn output_with_forwarded_stderr(mut child: Child, stdin: Option<&[u8]>) -> io::R
     let mut output = output_result?;
     write_result?;
     output.stderr = stderr_result?;
+    if !output.status.success() {
+        let mut stderr = io::stderr();
+        let _ = stderr.write_all(&output.stderr);
+        let _ = stderr.flush();
+    }
     Ok(output)
 }
 
@@ -1274,7 +1373,7 @@ pub(super) fn find_installed_remote_api_herdr(
 }
 
 fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<RemotePlatform> {
-    let output = ssh.sh_output("uname -s\nuname -m\n")?;
+    let output = ssh.sh_output_captured("uname -s\nuname -m\n")?;
     let mut windows_uname_hint = false;
     let posix_error = if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1301,10 +1400,11 @@ fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<RemotePlatform> {
     ) {
         return Err(posix_error);
     }
-    let windows_output = match ssh.framed_user_shell_output(&windows_platform_probe_command()) {
-        Ok(output) if output.status.success() => output,
-        _ => return Err(posix_error),
-    };
+    let windows_output =
+        match ssh.framed_user_shell_output_captured(&windows_platform_probe_command()) {
+            Ok(output) if output.status.success() => output,
+            _ => return Err(posix_error),
+        };
     match parse_windows_platform_probe(&String::from_utf8_lossy(&windows_output.stdout)) {
         Ok(Some(platform)) => Ok(platform),
         Ok(None) => Err(posix_error),
@@ -1354,7 +1454,8 @@ fn remote_binary_candidates(
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Vec<RemoteHerdr>> {
     if remote_herdr.platform.is_windows() {
-        let output = ssh.framed_user_shell_output(&windows_remote_binary_candidate_command())?;
+        let output =
+            ssh.framed_user_shell_output_captured(&windows_remote_binary_candidate_command())?;
         if !output.status.success() {
             return Err(command_failed("remote binary discovery failed", &output));
         }
@@ -1386,7 +1487,7 @@ fn remote_binary_candidates(
 
 fn windows_remote_binary_candidate_command() -> String {
     windows_powershell_script_command(&format!(
-        r#"function Emit-HerdrPath([string]$CandidatePath) {{ if ([string]::IsNullOrWhiteSpace($CandidatePath) -or -not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) {{ return }}; $candidateFullPath = [System.IO.Path]::GetFullPath($CandidatePath); $encodedCandidate = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($candidateFullPath)); [Console]::Out.WriteLine('{WINDOWS_REMOTE_PATH_MARKER}' + $encodedCandidate) }}; $pathCommand = Get-Command herdr.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $pathCommand) {{ Emit-HerdrPath $pathCommand.Source }}; $herdrHome = if ([string]::IsNullOrWhiteSpace($env:HERDR_HOME)) {{ Join-Path $env:USERPROFILE '.herdr' }} else {{ $env:HERDR_HOME }}; $activeJunction = Get-Item -LiteralPath (Join-Path $herdrHome 'packages\standalone\current') -Force -ErrorAction SilentlyContinue; if ($null -ne $activeJunction -and -not [string]::IsNullOrWhiteSpace([string]$activeJunction.Target)) {{ Emit-HerdrPath (Join-Path ([string]$activeJunction.Target) 'herdr.exe') }}; exit 0"#
+        r#"function Emit-HerdrPath([string]$CandidatePath) {{ if ([string]::IsNullOrWhiteSpace($CandidatePath) -or -not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) {{ return }}; $candidateFullPath = [System.IO.Path]::GetFullPath($CandidatePath); $encodedCandidate = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($candidateFullPath)); [Console]::Out.WriteLine('{WINDOWS_REMOTE_PATH_MARKER}' + $encodedCandidate) }}; $pathCommand = Get-Command herdr.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $pathCommand) {{ Emit-HerdrPath $pathCommand.Source }}; Get-Process -Name herdr,herdr-dev -ErrorAction SilentlyContinue | ForEach-Object {{ try {{ Emit-HerdrPath $_.Path }} catch {{}} }}; $herdrHome = if ([string]::IsNullOrWhiteSpace($env:HERDR_HOME)) {{ Join-Path $env:USERPROFILE '.herdr' }} else {{ $env:HERDR_HOME }}; $activeJunction = Get-Item -LiteralPath (Join-Path $herdrHome 'packages\standalone\current') -Force -ErrorAction SilentlyContinue; if ($null -ne $activeJunction -and -not [string]::IsNullOrWhiteSpace([string]$activeJunction.Target)) {{ Emit-HerdrPath (Join-Path ([string]$activeJunction.Target) 'herdr.exe') }}; exit 0"#
     ))
 }
 
@@ -1523,7 +1624,7 @@ fn remote_client_status(
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Option<RemoteClientStatusJson>> {
     let command = remote_herdr.executable.status_client_command();
-    let output = ssh.shell_output(&remote_herdr.platform, &command)?;
+    let output = ssh.shell_output_captured(&remote_herdr.platform, &command)?;
     if !output.status.success() {
         if output.status.code() == Some(255) {
             return Err(command_failed("remote SSH connection failed", &output));
@@ -1550,7 +1651,7 @@ fn remote_binary_supports_endpoint_requirement(
 fn remote_binary_exists(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
     let command = remote_herdr.executable.exists_command();
     Ok(ssh
-        .shell_output(&remote_herdr.platform, &command)?
+        .shell_output_captured(&remote_herdr.platform, &command)?
         .status
         .success())
 }
@@ -4209,7 +4310,17 @@ mod tests {
 
         let command = decode_windows_command(&windows_remote_binary_candidate_command());
         assert!(command.contains("Get-Command herdr.exe"));
+        assert!(command.contains("Get-Process -Name herdr,herdr-dev"));
         assert!(command.contains("$activeJunction.Target"));
+    }
+
+    #[test]
+    fn remote_session_discovery_keeps_only_running_valid_names_and_ignores_extra_fields() {
+        let sessions = parse_running_remote_sessions(
+            r#"{"future":"ignored","sessions":[{"name":"default","running":true,"extra":1},{"name":"work","running":false},{"name":"bad/name","running":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(sessions, ["default"]);
     }
 
     #[test]
