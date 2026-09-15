@@ -247,3 +247,5 @@ jobs:
             herdr-windows-x86_64.zip
             BUILD_INFO.txt
           retention-days: 7
+
+# fork build trigger
